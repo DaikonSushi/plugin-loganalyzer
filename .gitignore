@@ -1,0 +1,24 @@
+# Binaries
+loganalyzer-plugin
+loganalyzer-plugin-test
+loganalyzer-plugin_*
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Go
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+go.work

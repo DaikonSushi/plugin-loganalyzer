@@ -1,0 +1,120 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+            suffix: linux_amd64
+          - goos: linux
+            goarch: arm64
+            suffix: linux_arm64
+          - goos: darwin
+            goarch: amd64
+            suffix: darwin_amd64
+          - goos: darwin
+            goarch: arm64
+            suffix: darwin_arm64
+          - goos: windows
+            goarch: amd64
+            suffix: windows_amd64.exe
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+
+      - name: Update go.mod for CI
+        run: |
+          # Remove local replace directive for CI build
+          sed -i '/^replace/d' go.mod
+          cat go.mod
+
+      - name: Get dependencies
+        run: go mod tidy
+
+      - name: Build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 0
+        run: |
+          go build -ldflags="-s -w" -o loganalyzer-plugin_${{ matrix.suffix }} .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: loganalyzer-plugin_${{ matrix.suffix }}
+          path: loganalyzer-plugin_${{ matrix.suffix }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: ./artifacts
+
+      - name: Prepare release files
+        run: |
+          mkdir -p release
+          find ./artifacts -type f -name "loganalyzer-plugin_*" -exec cp {} release/ \;
+          ls -la release/
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: release/*
+          generate_release_notes: true
+          body: |
+            ## Log Analyzer Plugin Release
+            
+            AI-powered log analysis plugin using knot-cli for bot-platform.
+            
+            ### Features
+            - 🔍 AI-powered log analysis using knot-cli
+            - 📋 Unique task ID for each analysis request
+            - ⏱️ Duration tracking for debugging
+            - 📁 Output saved to shared_data directory
+            - 🔄 Concurrent analysis support
+            - 📊 Task status tracking
+            
+            ### Installation
+            ```bash
+            ./botctl install https://github.com/DaikonSushi/plugin-loganalyzer
+            ```
+            
+            ### Configuration
+            Set these environment variables:
+            - `KNOT_CLI_PATH`: Path to knot-cli binary
+            - `WORKSPACE_PATH`: Codebase workspace for analysis
+            - `SYSTEM_PROMPT_PATH`: System prompt file for AI
+            - `SHARED_DATA_PATH`: Output directory (shared with napcat)
+            
+            ### Quick Start
+            ```
+            /analyzehelp - Show help
+            /analyze <log_content> - Analyze log
+            /analyzestatus [task_id] - Check task status
+            ```
+            
+            ### Supported Platforms
+            - Linux (amd64, arm64)
+            - macOS (amd64, arm64)
+            - Windows (amd64)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
