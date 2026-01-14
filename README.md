@@ -30,24 +30,19 @@ Create a configuration file at `plugins-config/loganalyzer.json`:
 ```json
 {
   "name": "loganalyzer",
-  "enabled": true,
-  "binary": "loganalyzer-plugin",
-  "description": "AI-powered log analysis plugin using knot-cli",
   "version": "1.0.0",
+  "description": "AI-powered log analysis plugin using knot-cli",
   "author": "hovanzhang",
   "commands": [
     "analyze",
     "analyzestatus",
     "analyzehelp"
   ],
-  "env": {
-    "KNOT_CLI_PATH": "knot-cli",
-    "WORKSPACE_PATH": "/path/to/your/codebase",
-    "SYSTEM_PROMPT_PATH": "/path/to/lookup_rule.md",
-    "SHARED_DATA_PATH": "/app/shared_data"
-  }
+  "binary_name": "loganalyzer-plugin"
 }
 ```
+
+**Note**: Environment variables (like `KNOT_CLI_PATH`, `WORKSPACE_PATH`, etc.) should be set at the Docker container level or shell environment, not in the plugin JSON config.
 
 ### Environment Variables
 
@@ -121,26 +116,119 @@ With task_id - shows detailed status:
 
 ## Docker Setup
 
-Make sure to mount the shared_data volume in your docker-compose:
+Since `knot-cli` typically cannot run inside Docker containers (due to dependencies, licensing, or environment requirements), the plugin supports **Proxy Mode** - calling a lightweight HTTP service running on the host machine.
+
+### Recommended: Proxy Mode (for Docker)
+
+This mode runs `knot-cli` on the host machine via an HTTP proxy service.
+
+#### Step 1: Start knot-proxy on Host Machine
+
+```bash
+# Set environment variables
+export KNOT_CLI_PATH=/usr/local/bin/knot-cli
+export WORKSPACE_PATH=/path/to/your/codebase
+export SYSTEM_PROMPT_PATH=/path/to/lookup_rule.md
+export SHARED_DATA_PATH=/path/to/napcat/shared-data
+
+# Start the proxy
+cd knot-proxy
+./start-knot-proxy.sh
+```
+
+Or run manually:
+```bash
+go build -o knot-proxy .
+./knot-proxy \
+  -knot-cli=/usr/local/bin/knot-cli \
+  -workspace=/path/to/your/codebase \
+  -system-prompt=/path/to/lookup_rule.md \
+  -shared-data=/path/to/napcat/shared-data \
+  -listen=:9999
+```
+
+#### Step 2: Configure docker-compose.yaml
+
+```yaml
+services:
+  bot-platform:
+    image: docker.io/daikonsushi/bot-platform:latest
+    volumes:
+      - ./bot-platform/plugins-bin:/app/plugins-bin
+      - ./bot-platform/plugins-config:/app/plugins-config
+      - ./shared-data:/shared-data
+    environment:
+      # Use proxy mode to call knot-cli on host
+      - LOGANALYZER_MODE=proxy
+      - KNOT_PROXY_URL=http://host.docker.internal:9999
+      - SHARED_DATA_PATH=/shared-data
+    # Required for Linux to access host
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  napcat:
+    volumes:
+      - ./shared-data:/shared-data
+```
+
+#### Architecture Diagram
+
+```
+┌────────────────────────────────────────────────────────────────┐
+│                          Host Machine                          │
+│                                                                │
+│  ┌──────────────────────────────────────────────────────────┐ │
+│  │              knot-proxy (HTTP Service)                   │ │
+│  │                 Listen: localhost:9999                   │ │
+│  │                                                          │ │
+│  │   POST /analyze  ──────►  Execute knot-cli chat ...      │ │
+│  │   GET /status/:id ─────►  Check analysis status          │ │
+│  └──────────────────────────────────────────────────────────┘ │
+│                              ▲                                 │
+│                              │ HTTP                            │
+│  ┌───────────────────────────┴──────────────────────────────┐ │
+│  │              Docker: bot-platform                        │ │
+│  │   loganalyzer-plugin ──► HTTP host.docker.internal:9999  │ │
+│  └──────────────────────────────────────────────────────────┘ │
+│                              │                                 │
+│                              │ /shared-data volume             │
+│                              ▼                                 │
+│  ┌──────────────────────────────────────────────────────────┐ │
+│  │              Docker: napcat                              │ │
+│  │         Read /shared-data/analysis_XXX.txt               │ │
+│  └──────────────────────────────────────────────────────────┘ │
+└────────────────────────────────────────────────────────────────┘
+```
+
+### Alternative: Direct Mode (if knot-cli can run in container)
+
+If you can run knot-cli inside the Docker container:
 
 ```yaml
 services:
   bot-platform:
     volumes:
-      - shared_data:/app/shared_data
+      - /usr/local/bin/knot-cli:/app/bin/knot-cli:ro
+      - /path/to/your/codebase:/app/workspace:ro
     environment:
-      - KNOT_CLI_PATH=/usr/local/bin/knot-cli
-      - WORKSPACE_PATH=/data/codebase
-      - SYSTEM_PROMPT_PATH=/data/prompts/lookup_rule.md
-      - SHARED_DATA_PATH=/app/shared_data
-
-  napcat:
-    volumes:
-      - shared_data:/app/napcat/shared_data
-
-volumes:
-  shared_data:
+      - LOGANALYZER_MODE=direct
+      - KNOT_CLI_PATH=/app/bin/knot-cli
+      - WORKSPACE_PATH=/app/workspace
+      - SHARED_DATA_PATH=/shared-data
 ```
+
+**Note**: The knot-cli binary must be compatible with Alpine Linux (the container OS).
+
+### Environment Variables
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `LOGANALYZER_MODE` | `proxy` or `direct` | `proxy` |
+| `KNOT_PROXY_URL` | URL to knot-proxy service (proxy mode) | `http://host.docker.internal:9999` |
+| `KNOT_CLI_PATH` | Path to knot-cli binary (direct mode) | `knot-cli` |
+| `WORKSPACE_PATH` | Codebase workspace (direct mode only) | - |
+| `SYSTEM_PROMPT_PATH` | System prompt file (direct mode only) | - |
+| `SHARED_DATA_PATH` | Output directory shared with napcat | `/shared-data` |
 
 ## Building from Source
 

@@ -1,19 +1,12 @@
 {
   "name": "loganalyzer",
-  "enabled": true,
-  "binary": "loganalyzer-plugin",
-  "description": "AI-powered log analysis plugin using knot-cli",
   "version": "1.0.0",
+  "description": "AI-powered log analysis plugin using knot-cli",
   "author": "hovanzhang",
   "commands": [
     "analyze",
     "analyzestatus",
     "analyzehelp"
   ],
-  "env": {
-    "KNOT_CLI_PATH": "knot-cli",
-    "WORKSPACE_PATH": "/path/to/your/codebase",
-    "SYSTEM_PROMPT_PATH": "/path/to/lookup_rule.md",
-    "SHARED_DATA_PATH": "/app/shared_data"
-  }
+  "binary_name": "loganalyzer-plugin"
 }

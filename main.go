@@ -1,10 +1,17 @@
 // plugin-loganalyzer - A log analysis plugin using knot-cli for AI-powered log analysis
+// Supports two modes:
+// 1. Direct mode: Execute knot-cli directly (when running on host)
+// 2. Proxy mode: Call knot-proxy HTTP service (when running in Docker container)
 package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -18,18 +25,49 @@ import (
 
 // Config holds plugin configuration
 type Config struct {
-	// KnotCLIPath is the path to knot-cli binary
-	KnotCLIPath string `json:"knot_cli_path"`
-	// WorkspacePath is the codebase workspace path for knot-cli
-	WorkspacePath string `json:"workspace_path"`
-	// SystemPromptPath is the path to system prompt file for knot-cli
+	// Mode can be "direct" or "proxy"
+	// "direct" - execute knot-cli directly
+	// "proxy" - call knot-proxy HTTP service
+	Mode string `json:"mode"`
+
+	// Direct mode settings
+	KnotCLIPath      string `json:"knot_cli_path"`
+	WorkspacePath    string `json:"workspace_path"`
 	SystemPromptPath string `json:"system_prompt_path"`
-	// SharedDataPath is the shared directory between napcat and bot-platform
+
+	// Proxy mode settings
+	ProxyURL string `json:"proxy_url"` // e.g., "http://host.docker.internal:9999"
+
+	// Common settings
 	SharedDataPath string `json:"shared_data_path"`
-	// MaxConcurrent is the maximum number of concurrent analysis tasks
-	MaxConcurrent int `json:"max_concurrent"`
-	// Timeout is the maximum time for each analysis task (in seconds)
-	Timeout int `json:"timeout"`
+	MaxConcurrent  int    `json:"max_concurrent"`
+	Timeout        int    `json:"timeout"`
+}
+
+// ProxyAnalyzeRequest is the request body for proxy mode
+type ProxyAnalyzeRequest struct {
+	RequestID  string `json:"request_id"`
+	LogContent string `json:"log_content"`
+}
+
+// ProxyAnalyzeResponse is the response from proxy service
+type ProxyAnalyzeResponse struct {
+	RequestID  string  `json:"request_id"`
+	Status     string  `json:"status"`
+	OutputFile string  `json:"output_file,omitempty"`
+	Duration   float64 `json:"duration_seconds,omitempty"`
+	Error      string  `json:"error,omitempty"`
+}
+
+// ProxyStatusResponse is the status response from proxy service
+type ProxyStatusResponse struct {
+	RequestID   string  `json:"request_id"`
+	Status      string  `json:"status"`
+	OutputFile  string  `json:"output_file,omitempty"`
+	Duration    float64 `json:"duration_seconds,omitempty"`
+	Error       string  `json:"error,omitempty"`
+	Content     string  `json:"content,omitempty"`
+	ContentSize int     `json:"content_size,omitempty"`
 }
 
 // TaskStatus represents the status of an analysis task
@@ -46,22 +84,24 @@ type TaskStatus struct {
 
 // LogAnalyzerPlugin provides AI-powered log analysis using knot-cli
 type LogAnalyzerPlugin struct {
-	bot       *pluginsdk.BotClient
-	config    Config
-	tasks     map[string]*TaskStatus
-	taskMutex sync.RWMutex
-	semaphore chan struct{}
+	bot        *pluginsdk.BotClient
+	config     Config
+	tasks      map[string]*TaskStatus
+	taskMutex  sync.RWMutex
+	semaphore  chan struct{}
+	httpClient *http.Client
 }
 
 // DefaultConfig returns default configuration
 func DefaultConfig() Config {
 	return Config{
-		KnotCLIPath:      "knot-cli",
-		WorkspacePath:    "",
-		SystemPromptPath: "",
-		SharedDataPath:   "/app/shared_data",
-		MaxConcurrent:    3,
-		Timeout:          300, // 5 minutes
+		Mode:           "proxy", // Default to proxy mode for Docker
+		KnotCLIPath:    "knot-cli",
+		WorkspacePath:  "",
+		ProxyURL:       "http://host.docker.internal:9999",
+		SharedDataPath: "/shared-data",
+		MaxConcurrent:  3,
+		Timeout:        300, // 5 minutes
 	}
 }
 
@@ -69,8 +109,8 @@ func DefaultConfig() Config {
 func (p *LogAnalyzerPlugin) Info() pluginsdk.PluginInfo {
 	return pluginsdk.PluginInfo{
 		Name:              "loganalyzer",
-		Version:           "1.0.0",
-		Description:       "AI-powered log analysis plugin using knot-cli",
+		Version:           "1.1.0",
+		Description:       "AI-powered log analysis plugin using knot-cli (supports proxy mode for Docker)",
 		Author:            "hovanzhang",
 		Commands:          []string{"analyze", "analyzestatus", "analyzehelp"},
 		HandleAllMessages: false,
@@ -86,6 +126,9 @@ func (p *LogAnalyzerPlugin) OnStart(bot *pluginsdk.BotClient) error {
 	p.config = DefaultConfig()
 
 	// Override from environment variables if set
+	if v := os.Getenv("LOGANALYZER_MODE"); v != "" {
+		p.config.Mode = v
+	}
 	if v := os.Getenv("KNOT_CLI_PATH"); v != "" {
 		p.config.KnotCLIPath = v
 	}
@@ -95,6 +138,9 @@ func (p *LogAnalyzerPlugin) OnStart(bot *pluginsdk.BotClient) error {
 	if v := os.Getenv("SYSTEM_PROMPT_PATH"); v != "" {
 		p.config.SystemPromptPath = v
 	}
+	if v := os.Getenv("KNOT_PROXY_URL"); v != "" {
+		p.config.ProxyURL = v
+	}
 	if v := os.Getenv("SHARED_DATA_PATH"); v != "" {
 		p.config.SharedDataPath = v
 	}
@@ -102,13 +148,23 @@ func (p *LogAnalyzerPlugin) OnStart(bot *pluginsdk.BotClient) error {
 	// Initialize semaphore for concurrency control
 	p.semaphore = make(chan struct{}, p.config.MaxConcurrent)
 
+	// Initialize HTTP client for proxy mode
+	p.httpClient = &http.Client{
+		Timeout: time.Duration(p.config.Timeout+30) * time.Second,
+	}
+
 	// Ensure shared data directory exists
 	if err := os.MkdirAll(p.config.SharedDataPath, 0755); err != nil {
 		bot.Log("warn", fmt.Sprintf("Failed to create shared data directory: %v", err))
 	}
 
-	bot.Log("info", fmt.Sprintf("Log analyzer plugin started with config: workspace=%s, shared_data=%s",
-		p.config.WorkspacePath, p.config.SharedDataPath))
+	bot.Log("info", fmt.Sprintf("Log analyzer plugin started in %s mode", p.config.Mode))
+	if p.config.Mode == "proxy" {
+		bot.Log("info", fmt.Sprintf("  proxy_url: %s", p.config.ProxyURL))
+	} else {
+		bot.Log("info", fmt.Sprintf("  workspace: %s", p.config.WorkspacePath))
+	}
+	bot.Log("info", fmt.Sprintf("  shared_data: %s", p.config.SharedDataPath))
 
 	return nil
 }
@@ -141,10 +197,16 @@ func (p *LogAnalyzerPlugin) OnCommand(ctx context.Context, bot *pluginsdk.BotCli
 
 // handleHelp shows plugin help information
 func (p *LogAnalyzerPlugin) handleHelp(bot *pluginsdk.BotClient, msg *pluginsdk.Message) {
+	modeInfo := fmt.Sprintf("Mode: %s", p.config.Mode)
+	if p.config.Mode == "proxy" {
+		modeInfo += fmt.Sprintf(" (%s)", p.config.ProxyURL)
+	}
+
 	bot.Reply(msg,
 		pluginsdk.Text("🔍 Log Analyzer Plugin\n"),
 		pluginsdk.Text("━━━━━━━━━━━━━━━━━━━━\n"),
-		pluginsdk.Text("AI-powered log analysis using knot-cli\n\n"),
+		pluginsdk.Text("AI-powered log analysis using knot-cli\n"),
+		pluginsdk.Text(modeInfo+"\n\n"),
 		pluginsdk.Text("Available Commands:\n\n"),
 		pluginsdk.Text("📊 /analyze <log_content>\n"),
 		pluginsdk.Text("   Analyze the given log content using AI\n"),
@@ -171,9 +233,14 @@ func (p *LogAnalyzerPlugin) handleAnalyze(ctx context.Context, bot *pluginsdk.Bo
 		return
 	}
 
-	// Check configuration
-	if p.config.WorkspacePath == "" {
+	// Check configuration based on mode
+	if p.config.Mode == "direct" && p.config.WorkspacePath == "" {
 		bot.Reply(msg, pluginsdk.Text("❌ Plugin not properly configured: workspace path not set\nPlease set WORKSPACE_PATH environment variable"))
+		return
+	}
+
+	if p.config.Mode == "proxy" && p.config.ProxyURL == "" {
+		bot.Reply(msg, pluginsdk.Text("❌ Plugin not properly configured: proxy URL not set\nPlease set KNOT_PROXY_URL environment variable"))
 		return
 	}
 
@@ -200,6 +267,7 @@ func (p *LogAnalyzerPlugin) handleAnalyze(ctx context.Context, bot *pluginsdk.Bo
 		pluginsdk.Text("━━━━━━━━━━━━━━━━━━━━\n"),
 		pluginsdk.Text(fmt.Sprintf("📋 Task ID: %s\n", taskID)),
 		pluginsdk.Text(fmt.Sprintf("📝 Log Length: %d chars\n", len(logContent))),
+		pluginsdk.Text(fmt.Sprintf("🔧 Mode: %s\n", p.config.Mode)),
 		pluginsdk.Text("⏳ Status: Queued for analysis...\n\n"),
 		pluginsdk.Text("Use /analyzestatus "+taskID+" to check progress"),
 	)
@@ -208,7 +276,7 @@ func (p *LogAnalyzerPlugin) handleAnalyze(ctx context.Context, bot *pluginsdk.Bo
 	go p.runAnalysis(task, logContent, msg)
 }
 
-// runAnalysis executes the knot-cli analysis
+// runAnalysis executes the analysis based on mode
 func (p *LogAnalyzerPlugin) runAnalysis(task *TaskStatus, logContent string, msg *pluginsdk.Message) {
 	// Acquire semaphore for concurrency control
 	p.semaphore <- struct{}{}
@@ -219,6 +287,90 @@ func (p *LogAnalyzerPlugin) runAnalysis(task *TaskStatus, logContent string, msg
 	task.Status = "running"
 	p.taskMutex.Unlock()
 
+	if p.config.Mode == "proxy" {
+		p.runAnalysisViaProxy(task, logContent, msg)
+	} else {
+		p.runAnalysisDirect(task, logContent, msg)
+	}
+}
+
+// runAnalysisViaProxy calls the knot-proxy HTTP service
+func (p *LogAnalyzerPlugin) runAnalysisViaProxy(task *TaskStatus, logContent string, msg *pluginsdk.Message) {
+	// Prepare request
+	reqBody := ProxyAnalyzeRequest{
+		RequestID:  task.ID,
+		LogContent: logContent,
+	}
+
+	jsonBody, err := json.Marshal(reqBody)
+	if err != nil {
+		p.completeTask(task, "", fmt.Errorf("failed to marshal request: %v", err), msg)
+		return
+	}
+
+	// Send analyze request
+	analyzeURL := p.config.ProxyURL + "/analyze"
+	p.bot.Log("info", fmt.Sprintf("[%s] Sending analyze request to proxy: %s", task.ID, analyzeURL))
+
+	resp, err := p.httpClient.Post(analyzeURL, "application/json", bytes.NewBuffer(jsonBody))
+	if err != nil {
+		p.completeTask(task, "", fmt.Errorf("failed to connect to proxy: %v", err), msg)
+		return
+	}
+	resp.Body.Close()
+
+	// Poll for status
+	statusURL := fmt.Sprintf("%s/status/%s", p.config.ProxyURL, task.ID)
+	pollInterval := 2 * time.Second
+	timeout := time.After(time.Duration(p.config.Timeout) * time.Second)
+
+	for {
+		select {
+		case <-timeout:
+			p.completeTask(task, "", fmt.Errorf("analysis timed out after %d seconds", p.config.Timeout), msg)
+			return
+		case <-time.After(pollInterval):
+			// Check status
+			statusResp, err := p.httpClient.Get(statusURL)
+			if err != nil {
+				p.bot.Log("warn", fmt.Sprintf("[%s] Failed to get status: %v", task.ID, err))
+				continue
+			}
+
+			var status ProxyStatusResponse
+			if err := json.NewDecoder(statusResp.Body).Decode(&status); err != nil {
+				statusResp.Body.Close()
+				p.bot.Log("warn", fmt.Sprintf("[%s] Failed to decode status: %v", task.ID, err))
+				continue
+			}
+			statusResp.Body.Close()
+
+			p.bot.Log("info", fmt.Sprintf("[%s] Status: %s", task.ID, status.Status))
+
+			if status.Status == "completed" {
+				// Save content to local shared data
+				outputPath := filepath.Join(p.config.SharedDataPath, fmt.Sprintf("analysis_%s.txt", task.ID))
+				if status.Content != "" {
+					if err := os.WriteFile(outputPath, []byte(status.Content), 0644); err != nil {
+						p.bot.Log("warn", fmt.Sprintf("[%s] Failed to save output: %v", task.ID, err))
+					}
+				}
+				p.completeTaskWithResult(task, outputPath, status.Content, status.Duration, msg)
+				return
+			}
+
+			if status.Status == "failed" {
+				p.completeTask(task, "", fmt.Errorf("proxy error: %s", status.Error), msg)
+				return
+			}
+
+			// Still processing, continue polling
+		}
+	}
+}
+
+// runAnalysisDirect executes knot-cli directly
+func (p *LogAnalyzerPlugin) runAnalysisDirect(task *TaskStatus, logContent string, msg *pluginsdk.Message) {
 	// Create output file path
 	outputFileName := fmt.Sprintf("analysis_%s.txt", task.ID)
 	outputPath := filepath.Join(p.config.SharedDataPath, outputFileName)
@@ -356,16 +508,37 @@ func (p *LogAnalyzerPlugin) completeTask(task *TaskStatus, outputPath string, er
 		return
 	}
 
-	resultStr := string(result)
+	p.sendResult(task, outputPath, string(result), msg)
+}
 
+// completeTaskWithResult finalizes the task with known result content
+func (p *LogAnalyzerPlugin) completeTaskWithResult(task *TaskStatus, outputPath, content string, durationSec float64, msg *pluginsdk.Message) {
+	task.EndTime = time.Now()
+	if durationSec > 0 {
+		task.Duration = fmt.Sprintf("%.2fs", durationSec)
+	} else {
+		task.Duration = task.EndTime.Sub(task.StartTime).Round(time.Millisecond).String()
+	}
+	task.Status = "completed"
+
+	p.taskMutex.Lock()
+	p.tasks[task.ID] = task
+	p.taskMutex.Unlock()
+
+	p.sendResult(task, outputPath, content, msg)
+}
+
+// sendResult sends the analysis result to user
+func (p *LogAnalyzerPlugin) sendResult(task *TaskStatus, outputPath, resultStr string, msg *pluginsdk.Message) {
 	// Extract requestID if present
 	requestID := extractRequestID(resultStr)
 
 	// Truncate result if too long for chat message
 	const maxLength = 3000
 	truncated := false
-	if len(resultStr) > maxLength {
-		resultStr = resultStr[:maxLength] + "\n\n... [Result truncated, see full output in file]"
+	displayResult := resultStr
+	if len(displayResult) > maxLength {
+		displayResult = displayResult[:maxLength] + "\n\n... [Result truncated, see full output in file]"
 		truncated = true
 	}
 
@@ -384,13 +557,13 @@ func (p *LogAnalyzerPlugin) completeTask(task *TaskStatus, outputPath string, er
 	replyParts = append(replyParts,
 		pluginsdk.Text(fmt.Sprintf("📁 Output File: %s\n", outputPath)),
 		pluginsdk.Text("━━━━━━━━━━━━━━━━━━━━\n\n"),
-		pluginsdk.Text(resultStr),
+		pluginsdk.Text(displayResult),
 	)
 
 	p.bot.Reply(msg, replyParts...)
 
 	// If truncated, also upload the full file
-	if truncated {
+	if truncated && outputPath != "" {
 		if msg.GroupID > 0 {
 			p.bot.UploadGroupFile(msg.GroupID, outputPath, fmt.Sprintf("analysis_%s.txt", task.ID), "/")
 		} else {
